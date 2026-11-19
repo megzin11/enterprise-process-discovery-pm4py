@@ -1,120 +1,116 @@
-# enterprise_p2p_pipeline.py
-import os
-import pandas as pd
+import argparse
+import time
+from pathlib import Path
 import pm4py
-
-graphviz_path = r'C:\Program Files\Graphviz\bin'
-os.environ["PATH"] += os.pathsep + graphviz_path
-
-def setup_directories():
-    """Create necessary directories for the repository."""
-    for folder in ["data", "visualizations"]:
-        if not os.path.exists(folder):
-            os.makedirs(folder)
-            print(f"[+] Created directory: {folder}/")
+from src.analytics import benchmark_discovery_miners, characterize_log, filter_top_k_variants, profile_bottlenecks
+from src.loader import configure_graphviz, load_event_log
+from src.visualize import export_bottleneck_dashboard, export_petri_net
 
 
-def run_etl_pipeline(input_path, output_path):
-    print(f"\n[*] STEP 1: Ingesting & Transforming ERP extract from {input_path}")
-    
-    # Some massive enterprise CSVs use different encodings or separators. 
-    # If it fails to read, try adding sep=';' or encoding='utf-8-sig'
-    df = pd.read_csv(input_path)
-    
-    # 1. Diagnostic: Print the exact columns found in the CSV
-    print(f"[*] Raw CSV Columns Detected: {df.columns.tolist()}")
-    
-    # 2. Resilient Column Mapping
-    # This dictionary catches common column name variations and maps them to PM4Py standards
-    col_mapping = {
-        # Case ID variations
-        'Order_ID': 'case:concept:name',
-        'case': 'case:concept:name',
-        'case concept:name': 'case:concept:name',
-        'Case ID': 'case:concept:name',
-        
-        # Activity variations
-        'Action_Step': 'concept:name',
-        'event': 'concept:name',
-        'event concept:name': 'concept:name',
-        'Activity': 'concept:name',
-        
-        # Timestamp variations
-        'Timestamp': 'time:timestamp',
-        'startTime': 'time:timestamp',
-        'event time:timestamp': 'time:timestamp',
-        'Complete Timestamp': 'time:timestamp'
-    }
-    
-    # Apply only the mappings that actually match the current dataframe
-    df.rename(columns=col_mapping, inplace=True)
-    
-    # 3. Architectural Safety Check
-    if 'case:concept:name' not in df.columns or 'time:timestamp' not in df.columns:
-        print("\n[-] FATAL ETL ERROR: Core mapping failed.")
-        print("[-] Look at the 'Raw CSV Columns' printed above. Find the actual names for Case ID and Timestamp, and add them to the 'col_mapping' dictionary in the code.")
-        return # Stops the script cleanly instead of throwing a KeyError
-        
-    # 4. Standardize Timestamps
-    # Use format='mixed' to handle messy enterprise timezone data
-    df['time:timestamp'] = pd.to_datetime(df['time:timestamp'], format='mixed', utc=True)
-    
-    # 5. Sort and Format
-    df = df.sort_values(by=['case:concept:name', 'time:timestamp'])
-    
-    print("[*] Formatting to PM4Py Event Log standard...")
-    event_log = pm4py.format_dataframe(df, case_id='case:concept:name', 
-                                       activity_key='concept:name', timestamp_key='time:timestamp')
-    
-    pm4py.write_xes(event_log, output_path)
-    print(f"[+] ETL Complete. Standardized XES log saved to: {output_path}")
+def run_pipeline(
+    input_path: Path,
+    out_dir: Path,
+    top_k: int = 10,
+    min_transition_freq: int = 500,
+    use_cache: bool = True,
+) -> None:
+    configure_graphviz()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-def discover_process_model(log_path, output_image_path):
-    """Discovers the operational Petri net from the event log."""
-    print(f"\n[*] STEP 2: Loading XES for Petri Net Discovery...")
-    log = pm4py.read_xes(log_path)
-    #VARIANT FILTERING
-    print("[*] Filtering out chaotic outliers (keeping the top 10 most common pathways)...")
-    # This keeps the main business flows and drops the rare 'spaghetti' edge cases
-    log = pm4py.filter_variants_top_k(log, k=10)
-    print("[*] Applying Inductive Miner algorithm...")
-    net, initial_marking, final_marking = pm4py.discover_petri_net_inductive(log)
-    
-    pm4py.save_vis_petri_net(net, initial_marking, final_marking, output_image_path)
-    print(f"[+] Petri Net visualization saved to: {output_image_path}")
+    t_total = time.perf_counter()
 
-def analyze_bottlenecks(log_path, output_image_path):
-    """Calculates throughput friction and end-to-end cycle times."""
-    print(f"\n[*] STEP 3: Executing Performance & Bottleneck Analysis...")
-    log = pm4py.read_xes(log_path)
-    
-    perf_dfg, start_activities, end_activities = pm4py.discover_performance_dfg(log)
-    pm4py.save_vis_performance_dfg(perf_dfg, start_activities, end_activities, output_image_path)
-    print(f"[+] Bottleneck Heatmap saved to: {output_image_path}")
-    
-    all_case_durations = pm4py.get_all_case_durations(log)
-    if all_case_durations:
-        avg_duration = sum(all_case_durations) / len(all_case_durations)
-        print(f"[+] OVERALL METRIC: Average End-to-End P2P Cycle Time: {avg_duration / 86400:.2f} Days")
+    # 1. Single-pass ingestion (with local pickle cache for iterative analysis)
+    df, load_ms, source_label = load_event_log(input_path, use_cache=use_cache)
+    print(f"\n=== Enterprise P2P Process Discovery Pipeline ===")
+    print(f"Loaded {len(df):,} events from {source_label} in {load_ms:.1f} ms")
+
+    # 2. Pre-mining log characterization on full unfiltered dataset
+    t_char = time.perf_counter()
+    stats = characterize_log(df)
+    char_ms = (time.perf_counter() - t_char) * 1000.0
+
+    print("\n=== Pre-Mining Log Characterization (Unfiltered ERP Log) ===")
+    print(f"  Total Cases             : {stats['total_cases']:,}")
+    print(f"  Total Events            : {stats['total_events']:,} (avg {stats['avg_events_per_case']} events/case)")
+    print(f"  Unique Activities       : {stats['unique_activities']}")
+    print(f"  Unique Trace Variants   : {stats['unique_variants']:,} (ratio: {stats['variant_to_case_ratio']:.4f})")
+    print(f"  Variant Shannon Entropy : {stats['variant_entropy_bits']} bits (normalized: {stats['normalized_entropy']})")
+    cov_str = " | ".join(f"Top-{k}: {pct:.2f}%" for k, pct in stats["top_k_coverage_pct"].items())
+    print(f"  Cumulative Coverage     : {cov_str}")
+
+    # 3. Filter top-k variants & benchmark 3 discovery algorithms
+    filtered_df = filter_top_k_variants(df, top_k)
+    filtered_cases = filtered_df["case:concept:name"].nunique()
+    filtered_pct = (filtered_cases / stats["total_cases"] * 100.0) if stats["total_cases"] else 0.0
+    print(f"\n=== Discovery Algorithm Benchmark (Top-{top_k} Variants: {filtered_cases:,} cases / {filtered_pct:.2f}%) ===")
+
+    bench_rows, models = benchmark_discovery_miners(filtered_df)
+    header = f"  {'Algorithm':<30} | {'Fitness':>7} | {'Prec.':>7} | {'F1':>7} | {'Simpl.':>7} | {'P/T/A':<11} | {'Disc. ms':>8}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for r in bench_rows:
+        pta = f"{r['places']}/{r['transitions']}/{r['arcs']}"
+        print(
+            f"  {r['algorithm']:<30} | {r['fitness']:>7.4f} | {r['precision']:>7.4f} | "
+            f"{r['f1_score']:>7.4f} | {r['simplicity']:>7.4f} | {pta:<11} | {r['discover_ms']:>8.1f}"
+        )
+
+    # Export Petri net for the highest-F1 balanced model
+    best_row = max(bench_rows, key=lambda x: x["f1_score"])
+    best_net, best_im, best_fm = models[best_row["algorithm"]]
+    petri_path = out_dir / "bpic_petri_net.png"
+    export_petri_net(best_net, best_im, best_fm, petri_path)
+    print(f"\n[+] Exported best-F1 Petri net ({best_row['algorithm']}) -> {petri_path}")
+
+    # 4. Full-log bottleneck & cycle-time profiling
+    t_perf = time.perf_counter()
+    cycle_stats, top_bottlenecks, case_days = profile_bottlenecks(df, min_transition_freq=min_transition_freq)
+    perf_ms = (time.perf_counter() - t_perf) * 1000.0
+
+    print("\n=== End-to-End Cycle Time & Transition Bottlenecks (Full Log) ===")
+    print(
+        f"  Mean: {cycle_stats['mean_days']:.2f} d | Median: {cycle_stats['median_days']:.2f} d | "
+        f"P90: {cycle_stats['p90_days']:.2f} d | P95: {cycle_stats['p95_days']:.2f} d"
+    )
+    print("\n  Top High-Volume Bottleneck Transitions:")
+    for _, row in top_bottlenecks.iterrows():
+        print(f"    {row['edge']:<58} | median: {row['median_days']:>6.2f} d | mean: {row['mean_days']:>6.2f} d | n={int(row['count']):,}")
+
+    dashboard_path = out_dir / "p2p_bottleneck_profile.png"
+    export_bottleneck_dashboard(case_days, top_bottlenecks, cycle_stats, dashboard_path)
+    size_kb = dashboard_path.stat().st_size / 1024.0
+    print(f"\n[+] Exported compact bottleneck dashboard -> {dashboard_path} ({size_kb:.1f} KB)")
+
+    total_ms = (time.perf_counter() - t_total) * 1000.0
+    print("\n=== Pipeline Timing Summary ===")
+    print(f"  Log Load ({source_label:<24}) : {load_ms:8.1f} ms")
+    print(f"  Pre-Mining Characterization          : {char_ms:8.1f} ms")
+    print(f"  Bottleneck Profiling (Vectorized)    : {perf_ms:8.1f} ms")
+    print(f"  Total End-to-End Runtime             : {total_ms:8.1f} ms\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Enterprise P2P Process Discovery & Bottleneck Pipeline.")
+    parser.add_argument("--input", type=Path, default=Path("data/BPI_Challenge_2019.xes"))
+    parser.add_argument("--out-dir", type=Path, default=Path("visualizations"))
+    parser.add_argument("--top-k", type=int, default=10, help="Top-k trace variants for process discovery")
+    parser.add_argument("--min-freq", type=int, default=500, help="Minimum transition count for bottleneck ranking")
+    parser.add_argument("--no-cache", action="store_true", help="Bypass local .core.pkl cache and re-parse XES")
+    args = parser.parse_args()
+
+    if not args.input.exists():
+        raise FileNotFoundError(
+            f"Event log not found at {args.input}. Place BPI_Challenge_2019.xes in data/ or pass --input."
+        )
+
+    run_pipeline(
+        input_path=args.input,
+        out_dir=args.out_dir,
+        top_k=args.top_k,
+        min_transition_freq=args.min_freq,
+        use_cache=not args.no_cache,
+    )
+
 
 if __name__ == "__main__":
-    # 1. Force absolute paths 
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    setup_directories()
-    
-    # 2. Point directly to the REAL BPIC XES Dataset
-    REAL_XES_DATA = os.path.join(BASE_DIR, "data", "BPI_Challenge_2019.xes")
-    PETRI_NET_IMG = os.path.join(BASE_DIR, "visualizations", "bpic_petri_net.png")
-    BOTTLENECK_IMG = os.path.join(BASE_DIR, "visualizations", "bpic_throughput.png")
-    
-    # 3. Execute Discovery Pipeline (Skipping ETL because it's already an XES file!)
-    print(f"\n[!] Initiating AI Discovery on Real Enterprise Data: {REAL_XES_DATA}")
-    
-    # Make sure your BPI_Challenge_2019.xes file is actually inside the data/ folder!
-    if os.path.exists(REAL_XES_DATA):
-        discover_process_model(REAL_XES_DATA, PETRI_NET_IMG)
-        analyze_bottlenecks(REAL_XES_DATA, BOTTLENECK_IMG)
-        print("\n[✓] Enterprise Process Discovery Pipeline executed successfully.")
-    else:
-        print(f"\n[-] ERROR: Could not find the file at {REAL_XES_DATA}")
-        print("[-] Please move BPI_Challenge_2019.xes into your 'data' folder.")
+    main()
